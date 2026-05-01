@@ -1,0 +1,47 @@
+[project]
+name = "mcp-google-merchant"
+version = "0.1.0"
+description = "Google Merchant Center / Merchant API integration for Model Context Protocol (MCP)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Francois Dragon"}
+]
+keywords = ["mcp", "google merchant", "merchant center", "merchant api", "shopping", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = [
+    "fastmcp==2.11.3",
+    "google-auth>=2.25.2",
+    "google-auth-oauthlib>=1.1.0",
+    "google-auth-httplib2>=0.1.1",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "aiohttp>=3.9.0",
+    "PyJWT>=2.8.0",
+    "cryptography>=41.0.0",
+    "uvicorn>=0.30.0",
+    "starlette>=0.37.2",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/francoisdragon/merchant-center-mcp"
+"Bug Tracker" = "https://github.com/francoisdragon/merchant-center-mcp/issues"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["merchant_server"]
+
+[tool.setuptools.packages.find]
+include = ["auth*"]

@@ -1,0 +1,20 @@
+# MCP requirements
+fastmcp==2.11.3
+
+# Google API requirements
+google-auth>=2.25.2
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+requests>=2.31.0
+
+# Environment configuration
+python-dotenv>=1.0.0
+
+# OAuth 2.1 per-user auth
+aiohttp>=3.9.0
+PyJWT>=2.8.0
+cryptography>=41.0.0
+
+# Web server for Render
+uvicorn>=0.30.0
+starlette>=0.37.2

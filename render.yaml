@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: mcp-google-merchant
+    env: python
+    region: frankfurt
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn merchant_server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /.well-known/oauth-protected-resource
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: MCP_ENABLE_OAUTH21
+        value: "true"
+      - key: GOOGLE_MCP_CREDENTIALS_DIR
+        value: /data/credentials
+      - key: MCP_OAUTH_STATE_PERSIST
+        value: "true"
+      - key: GOOGLE_MERCHANT_READ_ONLY
+        value: "1"
+      - key: MCP_HTTP_PATH
+        value: /mcp
+      - key: MERCHANT_MCP_EXTERNAL_URL
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_OAUTH_REDIRECT_URI
+        sync: false
+      - key: DEFAULT_MERCHANT_ACCOUNT_ID
+        sync: false
