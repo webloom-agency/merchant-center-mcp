@@ -154,7 +154,7 @@ def _init_oauth21():
 _oauth21_provider = _init_oauth21()
 
 _SERVER_INSTRUCTIONS = """\
-Google Merchant Center MCP server.
+Google Merchant Center MCP server (Merchant API v1).
 
 Tool-selection rules (follow these before any analytics or product tool):
 
@@ -174,6 +174,25 @@ Tool-selection rules (follow these before any analytics or product tool):
 4. All write operations may be disabled server-side via
    `GOOGLE_MERCHANT_READ_ONLY=1`; if a write fails for that reason, do not
    retry — surface the message to the user.
+
+5. Reports query language is the v1 MCQL dialect: snake_case table names
+   (`product_performance_view`, `price_competitiveness_product_view`, …) and
+   BARE field names (no `segments.` / `metrics.` qualifiers — those are
+   v1beta and now rejected). Date filter is `date BETWEEN 'YYYY-MM-DD'
+   AND 'YYYY-MM-DD'` or `date DURING LAST_30_DAYS`. Read the
+   `merchant-reports://reference` resource for the full schema before
+   building custom queries with `run_merchant_query`.
+
+6. If you get a 401 UNAUTHENTICATED with a message saying the GCP project
+   "is not registered with the merchant account", the GCP project used for
+   OAuth has never been registered with this Merchant Center via the
+   one-time `registerGcp` Merchant API method. Recovery: call the
+   `register_gcp_developer` tool on this server (requires
+   `GOOGLE_MERCHANT_READ_ONLY=0` since it's a setup write call) with the
+   target Merchant Center account_id and a real Google-Account email
+   (NOT a service account) to act as the developer contact. Wait ~5
+   minutes after registration before retrying. See:
+   https://developers.google.com/merchant/api/guides/quickstart/registration
 """
 
 mcp = FastMCP(
@@ -206,20 +225,32 @@ try:
 except ImportError:
     logger.warning("python-dotenv not installed; skipping .env file loading")
 
+logger.info(
+    "Targeting Merchant API v1. Reminder: each Google Cloud project used for "
+    "OAuth must be registered ONCE per Merchant Center via `registerGcp` "
+    "before v1 calls work for that project (https://developers.google.com/"
+    "merchant/api/guides/quickstart/registration). If the very first v1 call "
+    "returns 401 UNAUTHENTICATED with 'GCP project ... is not registered', "
+    "use the `register_gcp_developer` tool on this server (requires "
+    "GOOGLE_MERCHANT_READ_ONLY=0) to perform that one-time setup."
+)
+
 API_HOST = "https://merchantapi.googleapis.com"
 
-# All Merchant sub-APIs ship a v1beta surface today; some have promoted v1.
-# Override per-call via the *_API_VERSION env vars below if you need v1.
-ACCOUNTS_API_VERSION = os.getenv("MERCHANT_ACCOUNTS_API_VERSION", "v1beta")
-PRODUCTS_API_VERSION = os.getenv("MERCHANT_PRODUCTS_API_VERSION", "v1beta")
-DATASOURCES_API_VERSION = os.getenv("MERCHANT_DATASOURCES_API_VERSION", "v1beta")
-ISSUERESOLUTION_API_VERSION = os.getenv("MERCHANT_ISSUERESOLUTION_API_VERSION", "v1beta")
-REPORTS_API_VERSION = os.getenv("MERCHANT_REPORTS_API_VERSION", "v1beta")
-PROMOTIONS_API_VERSION = os.getenv("MERCHANT_PROMOTIONS_API_VERSION", "v1beta")
-QUOTA_API_VERSION = os.getenv("MERCHANT_QUOTA_API_VERSION", "v1beta")
-INVENTORIES_API_VERSION = os.getenv("MERCHANT_INVENTORIES_API_VERSION", "v1beta")
-NOTIFICATIONS_API_VERSION = os.getenv("MERCHANT_NOTIFICATIONS_API_VERSION", "v1beta")
-CONVERSIONS_API_VERSION = os.getenv("MERCHANT_CONVERSIONS_API_VERSION", "v1beta")
+# Google discontinued every v1beta sub-API of the Merchant API on
+# 2026-02-28; everything is now on v1. Override per-call via the
+# *_API_VERSION env vars below if you ever need to pin a different surface
+# (e.g. v1alpha for experimental features).
+ACCOUNTS_API_VERSION = os.getenv("MERCHANT_ACCOUNTS_API_VERSION", "v1")
+PRODUCTS_API_VERSION = os.getenv("MERCHANT_PRODUCTS_API_VERSION", "v1")
+DATASOURCES_API_VERSION = os.getenv("MERCHANT_DATASOURCES_API_VERSION", "v1")
+ISSUERESOLUTION_API_VERSION = os.getenv("MERCHANT_ISSUERESOLUTION_API_VERSION", "v1")
+REPORTS_API_VERSION = os.getenv("MERCHANT_REPORTS_API_VERSION", "v1")
+PROMOTIONS_API_VERSION = os.getenv("MERCHANT_PROMOTIONS_API_VERSION", "v1")
+QUOTA_API_VERSION = os.getenv("MERCHANT_QUOTA_API_VERSION", "v1")
+INVENTORIES_API_VERSION = os.getenv("MERCHANT_INVENTORIES_API_VERSION", "v1")
+NOTIFICATIONS_API_VERSION = os.getenv("MERCHANT_NOTIFICATIONS_API_VERSION", "v1")
+CONVERSIONS_API_VERSION = os.getenv("MERCHANT_CONVERSIONS_API_VERSION", "v1")
 
 DEFAULT_MERCHANT_ACCOUNT_ID = os.environ.get("DEFAULT_MERCHANT_ACCOUNT_ID")
 GOOGLE_MERCHANT_READ_ONLY = (
@@ -698,6 +729,65 @@ async def get_business_info(
     data = _request(
         "GET",
         f"/accounts/{ACCOUNTS_API_VERSION}/accounts/{aid}/businessInfo",
+    )
+    return _dump(data)
+
+
+@mcp.tool()
+async def register_gcp_developer(
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID to register the calling GCP "
+            "project against. Use your PRIMARY (advanced/MCA) account ID — "
+            "Google says do NOT register against subaccounts. The signed-in "
+            "user must have ADMIN access on this account. If you only have "
+            "a brand name or website domain, call `find_accounts(query=\"...\")` "
+            "first to resolve the numeric ID."
+        )
+    ),
+    developer_email: Optional[str] = Field(
+        default=None,
+        description=(
+            "Real Google-Account email address that will become the developer "
+            "technical contact for Merchant API service announcements (NOT a "
+            "service account — service accounts can't receive emails). If "
+            "omitted, the call still links the GCP project to the Merchant "
+            "Center account but no contact is added."
+        ),
+    ),
+) -> str:
+    """One-time registration of the calling Google Cloud project with a Merchant
+    Center account, required since Merchant API v1 GA.
+
+    When to call: only if a v1 request returned `401 UNAUTHENTICATED` with a
+    message saying "GCP project with id ... is not registered with the merchant
+    account". Otherwise this is a no-op (and re-running may return
+    ALREADY_REGISTERED — that's fine, it confirms you're already set up).
+
+    Important:
+      - Run ONCE per Google Cloud project, against your PRIMARY Merchant Center
+        account only. The registration covers all linked subaccounts.
+      - The Merchant API must be enabled on the GCP project (APIs & Services →
+        Library → "Merchant API" → Enable). One-time, in the Cloud Console.
+      - This is a write call. Set `GOOGLE_MERCHANT_READ_ONLY=0` server-side
+        before invoking, then flip it back afterwards.
+      - Each Google Cloud project can be registered to only ONE Merchant Center
+        at a time. Trying to register a second time returns ALREADY_REGISTERED.
+      - Wait ~5 minutes after a successful registration before retrying real
+        API calls — propagation isn't instant.
+
+    Returns the resulting `DeveloperRegistration` resource (or the API error
+    surfaced unchanged if registration failed).
+    """
+    aid = normalize_account_id(account_id)
+    body: Dict[str, Any] = {}
+    if developer_email and str(developer_email).strip():
+        body["developerEmail"] = str(developer_email).strip()
+    data = _request(
+        "POST",
+        f"/accounts/{ACCOUNTS_API_VERSION}/accounts/{aid}"
+        f"/developerRegistration:registerGcp",
+        body=body,
     )
     return _dump(data)
 
@@ -1216,12 +1306,19 @@ async def run_merchant_query(
     ),
     query: str = Field(
         description=(
-            "Merchant Reports query. SQL-flavored DSL: "
-            "SELECT … FROM <view> WHERE … LIMIT …. Common views: "
-            "productPerformanceView, nonProductPerformanceView, productView, "
-            "priceCompetitivenessProductView, priceInsightsProductView, "
-            "bestSellersProductClusterView, bestSellersBrandView, "
-            "competitiveVisibilityCompetitorView."
+            "Merchant Reports query (Merchant API v1 MCQL). SQL-flavored DSL: "
+            "SELECT field1, field2 FROM <view> WHERE <conditions> "
+            "[ORDER BY field [DESC]] [LIMIT n]. "
+            "Use snake_case views and BARE field names (no `segments.` / "
+            "`metrics.` qualifiers — those were v1beta and are now rejected). "
+            "Common views: product_performance_view, "
+            "non_product_performance_view, product_view, "
+            "price_competitiveness_product_view, price_insights_product_view, "
+            "best_sellers_product_cluster_view, best_sellers_brand_view, "
+            "competitive_visibility_competitor_view. "
+            "Date filter is `date BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'` or "
+            "`date DURING LAST_30_DAYS`. See the `merchant-reports://reference` "
+            "resource for the full schema."
         )
     ),
     page_size: int = Field(default=1000, description="Max rows per page (1-10000)"),
@@ -1244,11 +1341,15 @@ async def run_merchant_query(
 
 
 def _date_range_clause(days: int) -> str:
-    """Build a 'segments.date BETWEEN ...' clause for the last N days (UTC)."""
+    """Build a `date BETWEEN ...` clause for the last N days (UTC).
+
+    Note: the v1 Merchant Reports query language drops the `segments.` /
+    `metrics.` qualifier prefixes used by v1beta — fields are bare snake_case.
+    """
     today = datetime.utcnow().date()
     start = today - timedelta(days=max(1, int(days)))
     end = today - timedelta(days=1)
-    return f"segments.date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'"
+    return f"date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'"
 
 
 @mcp.tool()
@@ -1263,16 +1364,21 @@ async def get_top_products(
     days: int = Field(default=30, description="Lookback window in days"),
     limit: int = Field(default=50, description="Max rows to return"),
 ) -> str:
-    """Top products by clicks over the last N days (productPerformanceView)."""
+    """Top products by clicks over the last N days (product_performance_view).
+
+    Uses Merchant API v1 query syntax: snake_case table name, bare field names
+    (no `segments.` / `metrics.` prefix), and `conversion_value` as a Price
+    object instead of `conversion_value_micros`.
+    """
     aid = normalize_account_id(account_id)
     where = _date_range_clause(days)
     query = (
-        "SELECT segments.offer_id, "
-        "metrics.clicks, metrics.impressions, metrics.click_through_rate, "
-        "metrics.conversions, metrics.conversion_value_micros "
-        "FROM productPerformanceView "
+        "SELECT offer_id, title, brand, "
+        "clicks, impressions, click_through_rate, "
+        "conversions, conversion_value "
+        "FROM product_performance_view "
         f"WHERE {where} "
-        f"ORDER BY metrics.clicks DESC "
+        f"ORDER BY clicks DESC "
         f"LIMIT {max(1, min(int(limit), 1000))}"
     )
     data = _request(
@@ -1297,19 +1403,19 @@ async def get_price_competitiveness(
     ),
     limit: int = Field(default=100, description="Max rows to return"),
 ) -> str:
-    """Price competitiveness benchmarks for products (priceCompetitivenessProductView)."""
+    """Price competitiveness benchmarks for products (price_competitiveness_product_view).
+
+    Uses Merchant API v1 query syntax: snake_case table name and bare
+    field names (no `<view>.` qualifier prefix).
+    """
     aid = normalize_account_id(account_id)
     where = ""
     if country:
-        where = f"WHERE price_competitiveness_product_view.report_country_code = '{country.upper()}'"
+        where = f"WHERE report_country_code = '{country.upper()}'"
     query = (
-        "SELECT price_competitiveness_product_view.id, "
-        "price_competitiveness_product_view.title, "
-        "price_competitiveness_product_view.brand, "
-        "price_competitiveness_product_view.price, "
-        "price_competitiveness_product_view.benchmark_price, "
-        "price_competitiveness_product_view.report_country_code "
-        "FROM priceCompetitivenessProductView "
+        "SELECT id, offer_id, title, brand, "
+        "price, benchmark_price, report_country_code "
+        "FROM price_competitiveness_product_view "
         f"{where} "
         f"LIMIT {max(1, min(int(limit), 10000))}"
     )
@@ -1336,27 +1442,22 @@ async def get_best_sellers(
     ),
     limit: int = Field(default=50, description="Max rows to return"),
 ) -> str:
-    """Best-selling product clusters in a country (bestSellersProductClusterView)."""
+    """Best-selling product clusters in a country (best_sellers_product_cluster_view).
+
+    Uses Merchant API v1 query syntax: snake_case table name and bare
+    field names (no `<view>.` qualifier prefix).
+    """
     aid = normalize_account_id(account_id)
-    clauses = [
-        f"best_sellers_product_cluster_view.report_country_code = '{country.upper()}'",
-    ]
+    clauses = [f"report_country_code = '{country.upper()}'"]
     if category_id:
-        clauses.append(
-            f"best_sellers_product_cluster_view.report_category_id = {int(category_id)}"
-        )
+        clauses.append(f"report_category_id = {int(category_id)}")
     where = " AND ".join(clauses)
     query = (
-        "SELECT best_sellers_product_cluster_view.title, "
-        "best_sellers_product_cluster_view.brand, "
-        "best_sellers_product_cluster_view.rank, "
-        "best_sellers_product_cluster_view.previous_rank, "
-        "best_sellers_product_cluster_view.relative_demand, "
-        "best_sellers_product_cluster_view.report_country_code, "
-        "best_sellers_product_cluster_view.report_category_id "
-        "FROM bestSellersProductClusterView "
+        "SELECT title, brand, rank, previous_rank, "
+        "relative_demand, report_country_code, report_category_id "
+        "FROM best_sellers_product_cluster_view "
         f"WHERE {where} "
-        "ORDER BY best_sellers_product_cluster_view.rank "
+        "ORDER BY rank "
         f"LIMIT {max(1, min(int(limit), 10000))}"
     )
     data = _request(
@@ -1444,32 +1545,58 @@ async def list_quotas(
 
 @mcp.resource("merchant-reports://reference")
 def merchant_reports_reference() -> str:
-    """Quick reference for the Merchant Reports query DSL."""
+    """Quick reference for the Merchant Reports query DSL (v1 syntax)."""
     return """
-    # Merchant Reports Query Language (short reference)
+    # Merchant Reports Query Language — MCQL (v1 syntax)
+
+    IMPORTANT: This is the post-2026 v1 syntax. v1beta is sunset.
+    Differences from v1beta:
+      - Table names are snake_case   (`product_performance_view`, NOT `productPerformanceView`)
+      - Fields are bare snake_case   (`offer_id`, NOT `segments.offer_id`)
+      - Metrics are bare snake_case  (`clicks`, NOT `metrics.clicks`)
+      - `conversion_value` is a Price object  (replaces `conversion_value_micros`)
+      - Date filter is just `date`   (NOT `segments.date`)
+
     Shape:
       SELECT field1, field2 FROM <view>
       WHERE <conditions>
       ORDER BY <field> [DESC]
       LIMIT <n>
 
-    Common views:
-      productPerformanceView         - clicks/impressions/conversions per product (segments.offer_id, segments.date, segments.program, segments.country_code)
-      nonProductPerformanceView      - performance unattributed to a single product
-      productView                    - product catalog snapshot (title, brand, price, item issues)
-      priceCompetitivenessProductView- price benchmarks vs. competitors (report_country_code)
-      priceInsightsProductView       - suggested price + projected uplift per product
-      bestSellersProductClusterView  - best-selling product clusters per country/category (rank, previous_rank, relative_demand)
-      bestSellersBrandView           - best-selling brands per country/category
-      competitiveVisibilityCompetitorView - relative impression share vs. top competitors
+    Common views (use exactly these snake_case names in FROM):
+      product_performance_view              - clicks/impressions/conversions per product
+                                              (offer_id, date, marketing_method, customer_country_code, ...)
+      non_product_performance_view          - performance unattributed to a single product
+      product_view                          - product catalog snapshot (title, brand, price, item issues)
+      price_competitiveness_product_view    - price benchmarks vs. competitors (report_country_code)
+      price_insights_product_view           - suggested price + projected uplift per product
+      best_sellers_product_cluster_view     - best-selling product clusters per country/category
+                                              (rank, previous_rank, relative_demand)
+      best_sellers_brand_view               - best-selling brands per country/category
+      competitive_visibility_competitor_view - relative impression share vs. top competitors
 
-    Date filters (segments.date is an ISO-8601 day):
-      WHERE segments.date BETWEEN '2025-01-01' AND '2025-01-31'
+    Date filters (date is an ISO-8601 day in the merchant timezone):
+      WHERE date BETWEEN '2026-04-01' AND '2026-04-30'
+      WHERE date DURING LAST_30_DAYS              -- relative
+      WHERE date DURING THIS_MONTH                -- relative
+
+    Examples:
+      SELECT offer_id, clicks, impressions
+      FROM product_performance_view
+      WHERE date BETWEEN '2026-04-01' AND '2026-04-30'
+      ORDER BY clicks DESC
+      LIMIT 50
+
+      SELECT id, title, price, benchmark_price
+      FROM price_competitiveness_product_view
+      WHERE report_country_code = 'FR'
+      LIMIT 100
 
     Notes:
       - Each view exposes its own set of selectable fields; mixing fields across
         views is not allowed.
-      - Pagination is via `pageToken` + `nextPageToken`; max page size is 10,000.
+      - Selecting any segment requires also selecting at least one metric.
+      - Pagination is via `pageToken` + `nextPageToken`; max page size is 100,000.
       - For free-form analytics use `run_merchant_query`; for canned reports use
         `get_top_products`, `get_price_competitiveness`, `get_best_sellers`.
     """
@@ -1505,22 +1632,39 @@ def google_merchant_workflow() -> str:
 @mcp.prompt("merchant_reports_help")
 def merchant_reports_help() -> str:
     return """
-    Examples:
+    Merchant Reports Query Language — examples (v1 syntax)
 
-    # Top 10 products by clicks last 30 days
-    SELECT segments.offer_id, metrics.clicks, metrics.impressions
-    FROM productPerformanceView
-    WHERE segments.date BETWEEN '2026-04-01' AND '2026-04-30'
-    ORDER BY metrics.clicks DESC
+    Reminder: post-2026 v1 syntax uses snake_case table names, bare field
+    names with NO `segments.` / `metrics.` prefixes, and `conversion_value`
+    in place of `conversion_value_micros`. v1beta syntax will be rejected.
+
+    # Top 10 products by clicks, last 30 days
+    SELECT offer_id, title, brand, clicks, impressions, click_through_rate
+    FROM product_performance_view
+    WHERE date BETWEEN '2026-04-01' AND '2026-04-30'
+    ORDER BY clicks DESC
     LIMIT 10
 
-    # Pricing benchmarks for US
-    SELECT price_competitiveness_product_view.id,
-           price_competitiveness_product_view.price,
-           price_competitiveness_product_view.benchmark_price
-    FROM priceCompetitivenessProductView
-    WHERE price_competitiveness_product_view.report_country_code = 'US'
+    # Same query using a relative date range
+    SELECT offer_id, clicks, impressions
+    FROM product_performance_view
+    WHERE date DURING LAST_30_DAYS
+    ORDER BY clicks DESC
+    LIMIT 10
+
+    # Pricing benchmarks for the US
+    SELECT id, offer_id, title, price, benchmark_price
+    FROM price_competitiveness_product_view
+    WHERE report_country_code = 'US'
     LIMIT 50
+
+    # Conversions and revenue per offer this month (FREE traffic)
+    SELECT offer_id, conversions, conversion_value
+    FROM product_performance_view
+    WHERE date DURING THIS_MONTH
+      AND marketing_method = 'ORGANIC'
+    ORDER BY conversion_value DESC
+    LIMIT 25
     """
 
 

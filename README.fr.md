@@ -17,6 +17,26 @@ l'utilisons quotidiennement pour brancher Merchant Center à nos workflows
 LLM ; nous l'avons publié en open source pour que vous puissiez en faire
 autant.
 
+> **À noter — Merchant API v1 (post-février 2026) :** ce serveur cible la
+> version **v1 stable** de chaque sous-API Merchant (Accounts, Products,
+> Reports, DataSources, IssueResolution, Promotions, Quota, Inventories,
+> Notifications, Conversions). Google a
+> [retiré v1beta le 28 février 2026](https://developers.google.com/merchant/api/guides/compatibility/migrate-v1beta-v1)
+> et le langage de requête Reports a changé : **noms de tables snake_case**
+> et **noms de champs sans préfixe** (plus de `segments.` / `metrics.`).
+> Tous les rapports prêts à l'emploi (`get_top_products`,
+> `get_price_competitiveness`, `get_best_sellers`) utilisent déjà la nouvelle
+> syntaxe. Voir [§7 Migration depuis v1beta](#7bis--migration-depuis-v1beta)
+> ci-dessous si vous avez vos propres requêtes à porter.
+
+> **Étape unique — `registerGcp` :** Google exige désormais que chaque
+> projet GCP utilisé pour appeler la Merchant API soit enregistré **une
+> fois** via la méthode `accounts.developerRegistration.registerGcp`, en
+> fournissant un email de contact développeur. Tant que ce n'est pas fait,
+> tout appel v1 depuis ce projet renvoie `403 PERMISSION_DENIED`. Voir le
+> [quickstart officiel](https://developers.google.com/merchant/api/guides/quickstart/registration).
+> Ce MCP n'appelle volontairement pas `registerGcp` automatiquement.
+
 ---
 
 ## Points clés
@@ -367,9 +387,10 @@ Essayez ces prompts (aucun setup additionnel après l'auth) :
 - *« Affiche les problèmes au niveau du compte 123456789 en français »* →
   `render_account_issues(language_code="fr")`.
 - *« Exécute cette requête Merchant Reports sur le compte 123456789 :
-  SELECT segments.offer_id, metrics.clicks, metrics.impressions FROM
-  productPerformanceView WHERE segments.date BETWEEN '2026-04-01' AND
-  '2026-04-30' ORDER BY metrics.clicks DESC LIMIT 20 »* →
+  SELECT offer_id, clicks, impressions FROM product_performance_view WHERE
+  date BETWEEN '2026-04-01' AND '2026-04-30' ORDER BY clicks DESC
+  LIMIT 20 »* (notez la syntaxe v1 : nom de table snake_case, pas de
+  qualificatifs `segments.`/`metrics.`) →
   `run_merchant_query`.
 - *« Compare les benchmarks de prix vs concurrents aux US pour le compte
   123456789 »* → `get_price_competitiveness`.
@@ -462,24 +483,74 @@ MERCHANT_QUOTA_API_VERSION
 
 ---
 
-## 7. DSL Merchant Reports
+## 7. DSL Merchant Reports (MCQL v1)
 
-La sous-API Reports parle le **Merchant Reports Query Language**, un DSL
-SQL-like distinct du GAQL mais conceptuellement proche. Vues principales :
+La sous-API Reports parle le **Merchant Center Query Language (MCQL)**, un
+DSL SQL-like conceptuellement proche du GAQL côté Ads. La **syntaxe v1**
+(post-février 2026) utilise des **noms de tables en snake_case** et des
+**noms de champs sans préfixe** — les qualificatifs (`segments.` /
+`metrics.`) ne sont plus acceptés.
 
-- `productPerformanceView` – clics / impressions / conversions par produit
-- `nonProductPerformanceView` – performance non attribuable à un produit
-- `productView` – snapshot du catalogue (titre, marque, prix, problèmes)
-- `priceCompetitivenessProductView` – benchmarks prix vs. concurrents
-- `priceInsightsProductView` – prix conseillé + uplift projeté
-- `bestSellersProductClusterView` – clusters de produits best-sellers
-- `bestSellersBrandView` – marques best-sellers
-- `competitiveVisibilityCompetitorView` – part d'impression vs. concurrents
+Vues principales (à utiliser telles quelles dans le `FROM`) :
+
+- `product_performance_view` – clics / impressions / conversions par produit
+- `non_product_performance_view` – performance non attribuable à un produit
+- `product_view` – snapshot du catalogue (titre, marque, prix, problèmes)
+- `price_competitiveness_product_view` – benchmarks prix vs. concurrents
+- `price_insights_product_view` – prix conseillé + uplift projeté
+- `best_sellers_product_cluster_view` – clusters de produits best-sellers
+- `best_sellers_brand_view` – marques best-sellers
+- `competitive_visibility_competitor_view` – part d'impression vs. concurrents
+
+Exemple rapide :
+
+```sql
+SELECT offer_id, clicks, impressions, click_through_rate
+FROM product_performance_view
+WHERE date BETWEEN '2026-04-01' AND '2026-04-30'
+ORDER BY clicks DESC
+LIMIT 50
+```
 
 Utilisez `run_merchant_query` pour les requêtes libres, ou les wrappers
 (`get_top_products`, `get_price_competitiveness`, `get_best_sellers`) pour
 les rapports courants. Le serveur expose aussi une ressource de référence
 `merchant-reports://reference` et le prompt `merchant_reports_help`.
+
+### 7.bis — Migration depuis v1beta
+
+Si vous avez des requêtes v1beta, scripts MCC ou middleware à porter :
+
+| v1beta | v1 |
+|---|---|
+| `productPerformanceView` (camelCase) | `product_performance_view` (snake_case) |
+| `segments.offer_id`, `segments.date`, … | `offer_id`, `date`, … (sans `segments.`) |
+| `metrics.clicks`, `metrics.impressions`, … | `clicks`, `impressions`, … (sans `metrics.`) |
+| `metrics.conversion_value_micros` (int64 micros) | `conversion_value` (objet `Price`) |
+| `Product.attributes` | `Product.productAttributes` |
+| `Product.attributes.gtin` (string) | `Product.productAttributes.gtins` (array de strings) |
+| `Product.attributes.taxes`, `Product.attributes.taxCategory` | **supprimés** |
+| `Product.channel`, `ProductInput.channel`, `DataSource.channel` | **supprimés** — utiliser le booléen `legacyLocal` |
+| `RegionalInventory.{price,salePrice,availability,…}` (top-level) | nichés sous `RegionalInventory.regionalInventoryAttributes` |
+| `LocalInventory.{price,salePrice,availability,quantity,…}` | nichés sous `LocalInventory.localInventoryAttributes` |
+| `RegionalInventory.customAttributes`, `LocalInventory.customAttributes` | **supprimés** |
+| `availability`, `condition`, `gender` (strings) | maintenant des **enums** |
+| `OnlineReturnPolicy.update` (PATCH) | **supprimé** — utiliser `OnlineReturnPolicy.create` |
+| `CreateAndConfigureAccountRequest.users` (pluriel) | `CreateAndConfigureAccountRequest.user` (singulier) |
+| Product/ProductInput `name` : encodage libre | Caractères spéciaux **doivent** être en base64url non-padded (RFC 4648 §5) |
+
+Autres changements opérationnels :
+
+- **`registerGcp` une fois par projet GCP** (voir l'encart en haut de
+  ce README). Un 403 PERMISSION_DENIED au premier appel signifie
+  généralement que cette étape manque.
+- **`pageSize` Reports** par défaut à `1000`, plafonné en dur à `100 000`.
+- **`pageToken`** : sémantique inchangée.
+- Le scope OAuth (`https://www.googleapis.com/auth/content`) et l'hôte API
+  (`merchantapi.googleapis.com`) sont inchangés.
+
+Référence complète :
+<https://developers.google.com/merchant/api/guides/compatibility/migrate-v1beta-v1>
 
 ---
 
@@ -561,7 +632,7 @@ Pour signaler une vulnérabilité : **security@webloom.fr**.
 - Racine API : `https://merchantapi.googleapis.com`
 - Index de référence : <https://developers.google.com/merchant/api/reference/rest>
 - Méthode reports.search :
-  <https://developers.google.com/merchant/api/reference/rest/reports_v1beta/accounts.reports>
+  <https://developers.google.com/merchant/api/reference/rest/reports_v1/accounts.reports>
 - Guide des scopes / accès :
   <https://developers.google.com/merchant/api/guides/authorization/access-client-accounts>
 - Vue d'ensemble du DSL Reports :

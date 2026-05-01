@@ -85,39 +85,39 @@ class TestNormalizeAccountId(unittest.TestCase):
 
 class TestReadOnlyGate(unittest.TestCase):
     def test_get_is_readonly(self):
-        self.assertTrue(merchant_server._is_readonly_method("GET", "/accounts/v1beta/accounts"))
+        self.assertTrue(merchant_server._is_readonly_method("GET", "/accounts/v1/accounts"))
 
     def test_search_is_readonly(self):
-        path = "/reports/v1beta/accounts/123/reports:search"
+        path = "/reports/v1/accounts/123/reports:search"
         self.assertTrue(merchant_server._is_readonly_method("POST", path))
 
     def test_render_is_readonly(self):
         self.assertTrue(
             merchant_server._is_readonly_method(
-                "POST", "/issueresolution/v1beta/accounts/1:renderaccountissues"
+                "POST", "/issueresolution/v1/accounts/1:renderaccountissues"
             )
         )
         self.assertTrue(
             merchant_server._is_readonly_method(
-                "POST", "/issueresolution/v1beta/accounts/1/products/2:renderproductissues"
+                "POST", "/issueresolution/v1/accounts/1/products/2:renderproductissues"
             )
         )
 
     def test_listsubaccounts_is_readonly(self):
         self.assertTrue(
             merchant_server._is_readonly_method(
-                "GET", "/accounts/v1beta/accounts/1:listSubaccounts"
+                "GET", "/accounts/v1/accounts/1:listSubaccounts"
             )
         )
 
     def test_post_insert_blocked_in_readonly_mode(self):
         with mock.patch.object(merchant_server, "GOOGLE_MERCHANT_READ_ONLY", True):
             with self.assertRaises(PermissionError):
-                merchant_server._request("POST", "/products/v1beta/accounts/1/products")
+                merchant_server._request("POST", "/products/v1/accounts/1/products")
             with self.assertRaises(PermissionError):
-                merchant_server._request("DELETE", "/products/v1beta/accounts/1/products/x")
+                merchant_server._request("DELETE", "/products/v1/accounts/1/products/x")
             with self.assertRaises(PermissionError):
-                merchant_server._request("PATCH", "/promotions/v1beta/accounts/1/promotions/x")
+                merchant_server._request("PATCH", "/promotions/v1/accounts/1/promotions/x")
 
 
 class TestPagination(unittest.TestCase):
@@ -171,6 +171,7 @@ class TestToolSurface(unittest.TestCase):
         "list_regions",
         "get_shipping_settings",
         "get_business_info",
+        "register_gcp_developer",
         "find_accounts",
         "list_products",
         "get_product",
@@ -205,6 +206,68 @@ class TestToolSurface(unittest.TestCase):
         self.assertIn("merchant-reports://reference", resources)
         self.assertIn("google_merchant_workflow", prompts)
         self.assertIn("merchant_reports_help", prompts)
+
+
+class TestReportQueryV1Syntax(unittest.TestCase):
+    """Lock in v1 MCQL syntax for canned-report queries.
+
+    Google retired Merchant API v1beta on 2026-02-28. The v1 query language
+    drops the `segments.` / `metrics.` qualifiers and switches table names
+    to snake_case. These tests fail loudly if anyone reverts a canned-report
+    query to v1beta-style strings.
+    """
+
+    def _capture_query(self, tool_coro):
+        captured = {}
+
+        def fake_request(method, path, *, params=None, body=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["body"] = body or {}
+            return {"results": []}
+
+        with mock.patch.object(merchant_server, "_request", side_effect=fake_request):
+            asyncio.run(tool_coro)
+        return captured
+
+    def test_get_top_products_uses_v1_syntax(self):
+        captured = self._capture_query(
+            merchant_server.get_top_products.fn(account_id="123456789", days=30, limit=10)
+        )
+        q = captured["body"]["query"]
+        self.assertIn("FROM product_performance_view", q)
+        self.assertNotIn("productPerformanceView", q)
+        self.assertNotIn("segments.", q)
+        self.assertNotIn("metrics.", q)
+        self.assertNotIn("conversion_value_micros", q)
+        self.assertIn("conversion_value", q)
+
+    def test_get_price_competitiveness_uses_v1_syntax(self):
+        captured = self._capture_query(
+            merchant_server.get_price_competitiveness.fn(
+                account_id="123456789", country="US", limit=50
+            )
+        )
+        q = captured["body"]["query"]
+        self.assertIn("FROM price_competitiveness_product_view", q)
+        self.assertNotIn("priceCompetitivenessProductView", q)
+        self.assertNotIn("price_competitiveness_product_view.", q)
+
+    def test_get_best_sellers_uses_v1_syntax(self):
+        captured = self._capture_query(
+            merchant_server.get_best_sellers.fn(
+                account_id="123456789", country="US", category_id=None, limit=20
+            )
+        )
+        q = captured["body"]["query"]
+        self.assertIn("FROM best_sellers_product_cluster_view", q)
+        self.assertNotIn("bestSellersProductClusterView", q)
+        self.assertNotIn("best_sellers_product_cluster_view.", q)
+
+    def test_date_range_clause_drops_segments_prefix(self):
+        clause = merchant_server._date_range_clause(7)
+        self.assertTrue(clause.startswith("date BETWEEN "))
+        self.assertNotIn("segments.", clause)
 
 
 class TestMockRequest(unittest.TestCase):
@@ -244,7 +307,7 @@ class TestMockRequest(unittest.TestCase):
 
         self.assertIn("accounts/1", result)
         self.assertEqual(captured["method"], "GET")
-        self.assertTrue(captured["url"].endswith("/accounts/v1beta/accounts"))
+        self.assertTrue(captured["url"].endswith("/accounts/v1/accounts"))
 
 
 class TestFindAccounts(unittest.TestCase):
