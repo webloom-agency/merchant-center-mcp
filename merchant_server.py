@@ -153,8 +153,32 @@ def _init_oauth21():
 
 _oauth21_provider = _init_oauth21()
 
+_SERVER_INSTRUCTIONS = """\
+Google Merchant Center MCP server.
+
+Tool-selection rules (follow these before any analytics or product tool):
+
+1. Every Merchant Center tool except `list_accounts` and `find_accounts`
+   requires a NUMERIC account_id (e.g. 123456789), NOT a domain, brand name
+   or URL.
+
+2. If the user gives you a brand name or website (e.g. "supersmart.com",
+   "Webloom") instead of a numeric ID, call `find_accounts(query="...")`
+   FIRST to resolve it to the matching numeric account_id, then call the
+   real tool. Do NOT ask the human for the ID before trying `find_accounts`.
+
+3. If the user gives no account context at all and `DEFAULT_MERCHANT_ACCOUNT_ID`
+   is not configured, call `list_accounts` to enumerate what they can see,
+   then ask which one to use.
+
+4. All write operations may be disabled server-side via
+   `GOOGLE_MERCHANT_READ_ONLY=1`; if a write fails for that reason, do not
+   retry — surface the message to the user.
+"""
+
 mcp = FastMCP(
     "google-merchant-server",
+    instructions=_SERVER_INSTRUCTIONS,
     dependencies=[
         "google-auth-oauthlib",
         "google-auth",
@@ -392,15 +416,49 @@ def normalize_account_id(value: Optional[str]) -> str:
     """
     Normalize a Merchant Center account ID. Accepts numeric strings or full
     resource names like 'accounts/123456789' and returns digits only.
+
+    If the caller passed something that looks like a brand name, domain or URL
+    (e.g. "supersmart.com"), raise an error whose message is a self-recovering
+    instruction so the LLM client knows to call `find_accounts` first instead
+    of asking the human for a numeric ID.
     """
     if value is None or str(value).strip() == "":
         if DEFAULT_MERCHANT_ACCOUNT_ID:
             value = DEFAULT_MERCHANT_ACCOUNT_ID
         else:
-            raise ValueError("account_id is required (Merchant Center ID).")
-    digits = re.sub(r"\D", "", str(value))
-    if not digits:
-        raise ValueError(f"Invalid account_id: {value!r}")
+            raise ValueError(
+                "account_id is required (Merchant Center numeric ID). "
+                "If you only have a brand name or website domain, call "
+                "`find_accounts(query=\"...\")` first to resolve it, then retry "
+                "with the numeric `account_id` from the result."
+            )
+    raw = str(value).strip()
+    digits = re.sub(r"\D", "", raw)
+
+    # Heuristic: looks like a domain / URL / brand name → guide the LLM to find_accounts.
+    looks_like_domain_or_brand = (
+        not digits
+        or "." in raw
+        or "/" in raw
+        or any(c.isalpha() for c in raw)
+    )
+    if not digits or (looks_like_domain_or_brand and len(digits) < 6):
+        # Strip a leading scheme so the suggested query is clean.
+        suggested_query = raw
+        if "://" in suggested_query:
+            try:
+                suggested_query = urlparse(suggested_query).hostname or raw
+            except Exception:
+                pass
+        raise ValueError(
+            f"Invalid Merchant Center account_id: {value!r}. "
+            f"This looks like a domain or brand name, not a numeric Merchant "
+            f"Center ID. RECOVERY: call "
+            f"`find_accounts(query=\"{suggested_query}\")` to look up the "
+            f"matching numeric account ID, then retry this tool with the "
+            f"`account_id` from the response. Do NOT ask the human for the ID "
+            f"unless `find_accounts` returns no matches."
+        )
     return digits
 
 
@@ -535,7 +593,13 @@ async def list_subaccounts(
 
 @mcp.tool()
 async def get_account(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
 ) -> str:
     """Get a single Merchant Center account."""
     aid = normalize_account_id(account_id)
@@ -545,7 +609,13 @@ async def get_account(
 
 @mcp.tool()
 async def list_users(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
 ) -> str:
     """List users with access to a Merchant Center account."""
     aid = normalize_account_id(account_id)
@@ -558,7 +628,13 @@ async def list_users(
 
 @mcp.tool()
 async def list_programs(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
 ) -> str:
     """List the Merchant Center programs (Free Listings, Shopping Ads, etc.) on an account."""
     aid = normalize_account_id(account_id)
@@ -571,7 +647,13 @@ async def list_programs(
 
 @mcp.tool()
 async def list_regions(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
 ) -> str:
     """List shipping regions configured for a Merchant Center account."""
     aid = normalize_account_id(account_id)
@@ -584,7 +666,13 @@ async def list_regions(
 
 @mcp.tool()
 async def get_shipping_settings(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
 ) -> str:
     """Get the shipping settings (services + rate groups) for an account."""
     aid = normalize_account_id(account_id)
@@ -597,7 +685,13 @@ async def get_shipping_settings(
 
 @mcp.tool()
 async def get_business_info(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
 ) -> str:
     """Get the business info (address, phone, customer service) for an account."""
     aid = normalize_account_id(account_id)
@@ -904,7 +998,13 @@ async def find_accounts(
 
 @mcp.tool()
 async def list_products(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     page_size: int = Field(default=50, description="Max products to return per page (1-1000)"),
     page_token: Optional[str] = Field(default=None, description="Pagination token"),
 ) -> str:
@@ -923,7 +1023,13 @@ async def list_products(
 
 @mcp.tool()
 async def get_product(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     product_name: str = Field(
         description=(
             "Product name. Either a full resource name "
@@ -944,7 +1050,13 @@ async def get_product(
 
 @mcp.tool()
 async def list_data_sources(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
 ) -> str:
     """List the product data sources (feeds) configured on a Merchant Center account."""
     aid = normalize_account_id(account_id)
@@ -957,7 +1069,13 @@ async def list_data_sources(
 
 @mcp.tool()
 async def get_data_source(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     data_source_id: str = Field(description="Data source ID"),
 ) -> str:
     """Get a single data source by ID."""
@@ -972,7 +1090,13 @@ async def get_data_source(
 
 @mcp.tool()
 async def list_file_uploads(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     data_source_id: str = Field(description="Data source ID"),
 ) -> str:
     """
@@ -999,7 +1123,13 @@ async def list_file_uploads(
 
 @mcp.tool()
 async def aggregate_product_statuses(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
 ) -> str:
     """
     Aggregate counts of product statuses (approved / pending / disapproved)
@@ -1018,7 +1148,13 @@ async def aggregate_product_statuses(
 
 @mcp.tool()
 async def render_account_issues(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     language_code: str = Field(default="en-US", description="BCP-47 language code"),
     time_zone: str = Field(default="UTC", description="IANA time zone identifier"),
 ) -> str:
@@ -1038,7 +1174,13 @@ async def render_account_issues(
 
 @mcp.tool()
 async def render_product_issues(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     product_name: str = Field(
         description="Product name (segment after '/products/') or a full resource name"
     ),
@@ -1065,7 +1207,13 @@ async def render_product_issues(
 
 @mcp.tool()
 async def run_merchant_query(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     query: str = Field(
         description=(
             "Merchant Reports query. SQL-flavored DSL: "
@@ -1105,7 +1253,13 @@ def _date_range_clause(days: int) -> str:
 
 @mcp.tool()
 async def get_top_products(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     days: int = Field(default=30, description="Lookback window in days"),
     limit: int = Field(default=50, description="Max rows to return"),
 ) -> str:
@@ -1131,7 +1285,13 @@ async def get_top_products(
 
 @mcp.tool()
 async def get_price_competitiveness(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     country: Optional[str] = Field(
         default=None, description="2-letter country code filter (e.g. 'US')"
     ),
@@ -1163,7 +1323,13 @@ async def get_price_competitiveness(
 
 @mcp.tool()
 async def get_best_sellers(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     country: str = Field(description="2-letter country code (e.g. 'US')"),
     category_id: Optional[str] = Field(
         default=None, description="Google product category ID to filter by"
@@ -1207,7 +1373,13 @@ async def get_best_sellers(
 
 @mcp.tool()
 async def list_promotions(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     page_size: int = Field(default=100, description="Max promotions per page"),
     page_token: Optional[str] = Field(default=None, description="Pagination token"),
 ) -> str:
@@ -1226,7 +1398,13 @@ async def list_promotions(
 
 @mcp.tool()
 async def get_promotion(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
     promotion_name: str = Field(
         description="Promotion ID or full resource name 'accounts/{aid}/promotions/{id}'"
     ),
@@ -1243,7 +1421,13 @@ async def get_promotion(
 
 @mcp.tool()
 async def list_quotas(
-    account_id: str = Field(description="Merchant Center account ID"),
+    account_id: str = Field(
+        description=(
+            "Numeric Merchant Center account ID (e.g. '123456789'). "
+            "If you only have a brand name or website domain, call "
+            "`find_accounts(query=\"...\")` first to resolve it."
+        )
+    ),
 ) -> str:
     """List API quota usage and limits per method group for an account."""
     aid = normalize_account_id(account_id)
@@ -1295,13 +1479,26 @@ def merchant_reports_reference() -> str:
 def google_merchant_workflow() -> str:
     return """
     Suggested workflow:
-      1) list_accounts()                       — pick the Merchant Center account
+
+      0) RESOLVE THE ACCOUNT FIRST.
+         If the user gave a brand name or website (e.g. "supersmart.com",
+         "Webloom") instead of a numeric Merchant Center ID, call
+         `find_accounts(query="<brand-or-domain>")` and use the numeric
+         `account_id` from the response in every subsequent call.
+         Only call `list_accounts()` if the user gave no context at all
+         (no name, no domain, no ID).
+
+      1) list_accounts()                       — enumerate accessible accounts
       2) list_subaccounts(account_id=...)      — for advanced (provider) accounts
       3) list_data_sources(account_id=...)     — see configured feeds
       4) aggregate_product_statuses(account_id=...) — check feed health
-      5) render_account_issues(account_id=...) — get human-readable issues
+      5) render_account_issues(account_id=...) — human-readable issues
       6) get_top_products(account_id=..., days=30) — analytics quick win
       7) run_merchant_query(account_id=..., query="SELECT ... FROM productPerformanceView ...")
+
+    Reminder: every tool except `list_accounts` and `find_accounts` requires a
+    numeric account_id. Never ask the human for the ID before trying
+    `find_accounts` first.
     """
 
 

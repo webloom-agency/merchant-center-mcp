@@ -49,6 +49,39 @@ class TestNormalizeAccountId(unittest.TestCase):
             with self.assertRaises(ValueError):
                 merchant_server.normalize_account_id("---")
 
+    def test_domain_input_suggests_find_accounts(self):
+        """A domain like 'supersmart.com' must trigger a recovery hint that
+        names the `find_accounts` tool with the right query, so the LLM
+        retries automatically instead of asking the human for an ID."""
+        with mock.patch.object(merchant_server, "DEFAULT_MERCHANT_ACCOUNT_ID", None):
+            with self.assertRaises(ValueError) as ctx:
+                merchant_server.normalize_account_id("supersmart.com")
+        msg = str(ctx.exception)
+        self.assertIn("find_accounts", msg)
+        self.assertIn("supersmart.com", msg)
+
+    def test_url_input_suggests_find_accounts_with_hostname(self):
+        with mock.patch.object(merchant_server, "DEFAULT_MERCHANT_ACCOUNT_ID", None):
+            with self.assertRaises(ValueError) as ctx:
+                merchant_server.normalize_account_id("https://www.webloom.fr/")
+        msg = str(ctx.exception)
+        self.assertIn("find_accounts", msg)
+        self.assertIn("www.webloom.fr", msg)
+
+    def test_brand_name_suggests_find_accounts(self):
+        with mock.patch.object(merchant_server, "DEFAULT_MERCHANT_ACCOUNT_ID", None):
+            with self.assertRaises(ValueError) as ctx:
+                merchant_server.normalize_account_id("SuperSmart")
+        msg = str(ctx.exception)
+        self.assertIn("find_accounts", msg)
+        self.assertIn("SuperSmart", msg)
+
+    def test_empty_input_also_suggests_find_accounts(self):
+        with mock.patch.object(merchant_server, "DEFAULT_MERCHANT_ACCOUNT_ID", None):
+            with self.assertRaises(ValueError) as ctx:
+                merchant_server.normalize_account_id(None)
+        self.assertIn("find_accounts", str(ctx.exception))
+
 
 class TestReadOnlyGate(unittest.TestCase):
     def test_get_is_readonly(self):
