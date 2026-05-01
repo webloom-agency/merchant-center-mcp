@@ -29,15 +29,17 @@ do the same.
 > used to call the Merchant API to be registered **once** via the
 > `accounts.developerRegistration.registerGcp` method, providing a developer
 > contact email. Until you do this, every v1 call from that project returns
-> `403 PERMISSION_DENIED`. See the
-> [official quickstart](https://developers.google.com/merchant/api/guides/quickstart/registration).
-> This MCP server intentionally does not call `registerGcp` automatically.
+> `401 UNAUTHENTICATED` with the message *"GCP project … is not registered
+> with the merchant account"*. The server ships a `register_gcp_developer`
+> tool plus three alternative recipes (curl, Python, MCP tool) for the
+> registration — see [§1.5](#15-one-time-gcp-project-registration-with-merchant-center).
 
 ---
 
 ## Highlights
 
-- **23 read tools** covering accounts, sub-accounts, products, data sources,
+- **24 tools** (23 read-only + the one-time `register_gcp_developer` setup
+  call) covering accounts, sub-accounts, products, data sources,
   promotions, quotas, item-issue rendering, the full Merchant Reports DSL
   (the equivalent of GAQL on the Ads side), and several canned report
   wrappers.
@@ -84,6 +86,7 @@ do the same.
 | `list_promotions(account_id)` | List promotions configured on an account |
 | `get_promotion(account_id, promotion_name)` | Fetch one promotion |
 | `list_quotas(account_id)` | API quota usage and limits per method group |
+| `register_gcp_developer(account_id, developer_email)` | One-time `registerGcp` setup required by Merchant API v1 GA — see [§1.5](#15-one-time-gcp-project-registration-with-merchant-center) |
 
 Plus an MCP resource at `merchant-reports://reference` and two prompts
 (`google_merchant_workflow`, `merchant_reports_help`).
@@ -155,6 +158,157 @@ Flow on first connection from an MCP client:
 > The Merchant API uses **only OAuth user credentials** for end users. There
 > is no `developer-token`, and service accounts only work via Merchant
 > Center "user" impersonation (rarely useful) — stick with OAuth.
+
+---
+
+## 1.5. One-time GCP-project registration with Merchant Center
+
+Since the Merchant API moved to v1 (Feb 2026), every Google Cloud project
+that calls the API must be **registered once** against a Merchant Center
+account. Until you do this, every v1 call returns:
+
+```
+401 UNAUTHENTICATED
+GCP project with id <PROJECT_ID> and number <PROJECT_NUMBER> is not registered with the merchant account.
+```
+
+This is a one-time setup per GCP project. The registration is global —
+once the project is registered, your OAuth users can call the API for **any
+Merchant Center account they have admin access on**, not just the one used
+for registration. (See the [official guide](https://developers.google.com/merchant/api/guides/quickstart/registration)
+for full background.)
+
+### 1.5.a — Prerequisites
+
+1. **Merchant API enabled** in your GCP project:
+   <https://console.cloud.google.com/apis/library/merchantapi.googleapis.com>
+   → select your project → click **Enable**.
+2. **Admin role** on the target Merchant Center account, for the Google
+   account whose OAuth credentials will issue the registration call.
+   Verify in *Merchant Center → Settings → People & access*.
+3. **A real Google-Account email** (not a service account) to register as
+   the developer technical contact. Google will send breaking-change /
+   sunset announcements to this address.
+
+### 1.5.b — Pick the right Merchant Center account to register against
+
+The registration record is stored in **one** Merchant Center, but it
+authorizes the **GCP project globally** — so the choice mostly affects
+where the developer contact entry lives, not what you can call.
+
+In order of preference:
+
+1. **Your organisation's advanced (MCA / multi-client) account** if you
+   have one. Subaccounts under it are implicitly covered, and the
+   developer contact lives in your own house.
+2. **Any standalone Merchant Center account you own** (e.g. one set up
+   for your company's own product feed, even if empty). Cleanest for
+   solo merchants and small agencies.
+3. **Last resort — a single client / partner Merchant Center where you
+   have Admin access**. Still works for *every* other client you admin
+   afterwards, but the developer contact gets created inside that
+   client's account (cosmetic concern only).
+
+> **Note for agencies / 3Ps**: Google explicitly recommends running the
+> registration against your *primary* Merchant Center account only — not
+> against each client subaccount. One registration covers all linked
+> subaccounts, and the GCP-level authorization covers all other client
+> accounts you can admin via OAuth. See the
+> [official guidance for 3Ps](https://developers.google.com/merchant/api/guides/quickstart/registration#important-considerations).
+
+### 1.5.c — Run the registration (pick one option)
+
+#### Option A — built-in MCP tool (recommended once the server is deployed)
+
+This server ships a `register_gcp_developer` tool. After [§2 Local
+development](#2-local-development) or [§3 Deployment](#3-deploying-to-your-favorite-host)
+is up:
+
+1. Temporarily set `GOOGLE_MERCHANT_READ_ONLY=0` (registration is a write
+   call) and redeploy / restart.
+2. From your MCP client, prompt:
+   > *"Use the Google Merchant MCP. Call `register_gcp_developer` with
+   > `account_id="<numeric MC ID>"` and
+   > `developer_email="<your.real.email@example.com>"`."*
+3. Expect a `DeveloperRegistration` resource in the response.
+4. Set `GOOGLE_MERCHANT_READ_ONLY=1` again and redeploy / restart.
+
+#### Option B — `curl` from your machine (no server needed)
+
+Get a short-lived access token via gcloud (must be signed in as a
+Merchant Center Admin):
+
+```bash
+gcloud auth application-default login \
+  --scopes=https://www.googleapis.com/auth/content,openid,email
+
+ACCESS_TOKEN=$(gcloud auth application-default print-access-token)
+ACCOUNT_ID="<numeric MC ID>"
+DEVELOPER_EMAIL="<your.real.email@example.com>"
+
+curl -X POST \
+  "https://merchantapi.googleapis.com/accounts/v1/accounts/${ACCOUNT_ID}/developerRegistration:registerGcp" \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"developerEmail\": \"${DEVELOPER_EMAIL}\"}"
+```
+
+#### Option C — standalone Python script (uses an existing refresh token)
+
+```python
+import os, requests
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+
+ACCOUNT_ID = "<numeric MC ID>"
+DEVELOPER_EMAIL = "<your.real.email@example.com>"
+
+creds = Credentials(
+    token=None,
+    refresh_token=os.environ["GOOGLE_MERCHANT_REFRESH_TOKEN"],
+    client_id=os.environ["GOOGLE_OAUTH_CLIENT_ID"],
+    client_secret=os.environ["GOOGLE_OAUTH_CLIENT_SECRET"],
+    token_uri="https://oauth2.googleapis.com/token",
+    scopes=["https://www.googleapis.com/auth/content"],
+)
+creds.refresh(Request())
+
+resp = requests.post(
+    f"https://merchantapi.googleapis.com/accounts/v1/accounts/{ACCOUNT_ID}"
+    f"/developerRegistration:registerGcp",
+    headers={
+        "Authorization": f"Bearer {creds.token}",
+        "Content-Type": "application/json",
+    },
+    json={"developerEmail": DEVELOPER_EMAIL},
+    timeout=30,
+)
+print(resp.status_code, resp.text)
+```
+
+### 1.5.d — After a successful registration
+
+Wait **~5 minutes** (Google docs note propagation isn't instant), then
+retry any v1 endpoint. From this point on every request from this GCP
+project is authorized.
+
+If you provided a `developer_email` for an address that *isn't* yet a
+Merchant Center user, the holder gets an invitation and **must accept it
+within 14 days**, otherwise the registration expires and you have to
+start over. Existing MC users are auto-promoted to `API_DEVELOPER` with
+no acceptance step.
+
+### 1.5.e — Common errors
+
+| Status | Body excerpt | Meaning / fix |
+|---|---|---|
+| `200 OK` | `{"name": "accounts/.../developerRegistration", "gcpIds": [...]}` | ✅ Done. Wait ~5 min, then call any v1 endpoint. |
+| `400 INVALID_ARGUMENT` | `developerEmail` invalid | Email is malformed or it's a service-account address. Use a real Google-Account email. |
+| `403 PERMISSION_DENIED` | "user does not have admin access" | The OAuth identity isn't an Admin of the target MC. Add Admin in MC → Settings → People & access. |
+| `404 NOT_FOUND` | "Merchant API not enabled" | You skipped Prereq #1. Enable Merchant API in the Cloud Console for that project. |
+| `409 ALREADY_EXISTS` / `ALREADY_REGISTERED` (same MC) | "already registered" | ✅ Good — your project was already set up. Nothing to do. |
+| `409 ALREADY_REGISTERED` (different MC) | "registered with another Merchant Center" | One GCP project can be tied to only one MC at a time. Either use a different GCP project or call `unregisterGcp` on the old MC first. |
+| Retry still 401 after 10+ min | Propagation delay edge case | Restart your server once to force a token refresh, then retry. |
 
 ---
 
