@@ -138,6 +138,7 @@ class TestToolSurface(unittest.TestCase):
         "list_regions",
         "get_shipping_settings",
         "get_business_info",
+        "find_accounts",
         "list_products",
         "get_product",
         "list_data_sources",
@@ -179,9 +180,10 @@ class TestMockRequest(unittest.TestCase):
     def test_list_accounts_calls_correct_endpoint(self):
         captured = {}
 
-        def fake_request(method, url, headers=None, params=None, json=None):
+        def fake_request(method, url, headers=None, params=None, json=None, timeout=None):
             captured["method"] = method
             captured["url"] = url
+            captured["timeout"] = timeout
 
             class _Resp:
                 status_code = 200
@@ -210,6 +212,169 @@ class TestMockRequest(unittest.TestCase):
         self.assertIn("accounts/1", result)
         self.assertEqual(captured["method"], "GET")
         self.assertTrue(captured["url"].endswith("/accounts/v1beta/accounts"))
+
+
+class TestFindAccounts(unittest.TestCase):
+    """Unit tests for find_accounts: index building, scoring, caching."""
+
+    def setUp(self):
+        # Reset the per-user cache before each test
+        merchant_server._accounts_index_cache.clear()
+
+    def _sample_index(self):
+        return [
+            {
+                "account_id": "111111111",
+                "account_name": "Webloom Shop",
+                "homepage_uri": "https://www.webloom.fr/",
+                "homepage_host": "webloom.fr",
+                "is_subaccount": False,
+                "parent_id": None,
+                "test_account": False,
+                "adult_content": False,
+                "language_code": "fr",
+                "time_zone": "Europe/Paris",
+            },
+            {
+                "account_id": "222222222",
+                "account_name": "Acme Inc",
+                "homepage_uri": "https://acme.example.com/",
+                "homepage_host": "acme.example.com",
+                "is_subaccount": False,
+                "parent_id": None,
+                "test_account": False,
+                "adult_content": False,
+                "language_code": "en",
+                "time_zone": "America/New_York",
+            },
+            {
+                "account_id": "333333333",
+                "account_name": "Webloom EU (sub)",
+                "homepage_uri": "https://eu.webloom.fr",
+                "homepage_host": "eu.webloom.fr",
+                "is_subaccount": True,
+                "parent_id": "111111111",
+                "test_account": False,
+                "adult_content": False,
+                "language_code": "fr",
+                "time_zone": "Europe/Paris",
+            },
+        ]
+
+    def test_score_exact_id_match_dominates(self):
+        idx = self._sample_index()
+        scores = {
+            a["account_id"]: merchant_server._score_account("222222222", a)
+            for a in idx
+        }
+        self.assertEqual(max(scores, key=scores.get), "222222222")
+
+    def test_score_domain_query_finds_homepage_host(self):
+        idx = self._sample_index()
+        scores = {
+            a["account_id"]: merchant_server._score_account("webloom.fr", a)
+            for a in idx
+        }
+        # Both Webloom rows should outscore Acme
+        self.assertGreater(scores["111111111"], scores["222222222"])
+        self.assertGreater(scores["333333333"], scores["222222222"])
+
+    def test_score_brand_name_query(self):
+        idx = self._sample_index()
+        scores = {
+            a["account_id"]: merchant_server._score_account("webloom", a)
+            for a in idx
+        }
+        self.assertGreater(scores["111111111"], scores["222222222"])
+
+    def test_normalize_homepage_strips_scheme_and_www(self):
+        self.assertEqual(merchant_server._normalize_homepage("https://www.webloom.fr/"), "webloom.fr")
+        self.assertEqual(merchant_server._normalize_homepage("http://acme.example.com"), "acme.example.com")
+        self.assertEqual(merchant_server._normalize_homepage(""), "")
+
+    def test_account_id_extraction(self):
+        self.assertEqual(merchant_server._account_id_from_resource("accounts/123456"), "123456")
+        self.assertEqual(merchant_server._account_id_from_resource("accounts/123-456-789"), "123456789")
+        self.assertEqual(merchant_server._account_id_from_resource(""), "")
+
+    def test_find_accounts_uses_cache(self):
+        builds = []
+
+        def fake_build(*, include_subaccounts, include_homepages):
+            builds.append((include_subaccounts, include_homepages))
+            return self._sample_index()
+
+        with mock.patch.object(merchant_server, "_build_accounts_index", side_effect=fake_build):
+            result1 = asyncio.run(
+                merchant_server.find_accounts.fn(
+                    query="webloom",
+                    top_k=5,
+                    include_subaccounts=True,
+                    include_homepage=True,
+                    force_refresh=False,
+                )
+            )
+            result2 = asyncio.run(
+                merchant_server.find_accounts.fn(
+                    query="acme",
+                    top_k=5,
+                    include_subaccounts=True,
+                    include_homepage=True,
+                    force_refresh=False,
+                )
+            )
+
+        # Index should have been built only once thanks to the cache
+        self.assertEqual(len(builds), 1)
+        self.assertIn("111111111", result1)
+        self.assertIn("222222222", result2)
+
+    def test_find_accounts_force_refresh_rebuilds(self):
+        builds = []
+
+        def fake_build(*, include_subaccounts, include_homepages):
+            builds.append(True)
+            return self._sample_index()
+
+        with mock.patch.object(merchant_server, "_build_accounts_index", side_effect=fake_build):
+            asyncio.run(
+                merchant_server.find_accounts.fn(
+                    query="webloom",
+                    top_k=5,
+                    include_subaccounts=True,
+                    include_homepage=True,
+                    force_refresh=False,
+                )
+            )
+            asyncio.run(
+                merchant_server.find_accounts.fn(
+                    query="webloom",
+                    top_k=5,
+                    include_subaccounts=True,
+                    include_homepage=True,
+                    force_refresh=True,
+                )
+            )
+
+        self.assertEqual(len(builds), 2)
+
+    def test_find_accounts_direct_id_hit_short_circuits_scoring(self):
+        with mock.patch.object(
+            merchant_server, "_build_accounts_index", return_value=self._sample_index()
+        ):
+            result = asyncio.run(
+                merchant_server.find_accounts.fn(
+                    query="222222222",
+                    top_k=5,
+                    include_subaccounts=True,
+                    include_homepage=False,
+                    force_refresh=False,
+                )
+            )
+
+        parsed = json.loads(result)
+        self.assertEqual(len(parsed["matches"]), 1)
+        self.assertEqual(parsed["matches"][0]["account_id"], "222222222")
 
 
 if __name__ == "__main__":

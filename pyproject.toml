@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-    {name = "Francois Dragon"}
+    {name = "Webloom", email = "contact@webloom.fr"}
 ]
 keywords = ["mcp", "google merchant", "merchant center", "merchant api", "shopping", "claude"]
 classifiers = [
@@ -33,8 +33,9 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/francoisdragon/merchant-center-mcp"
-"Bug Tracker" = "https://github.com/francoisdragon/merchant-center-mcp/issues"
+"Homepage" = "https://webloom.fr"
+"Source" = "https://github.com/webloom-fr/merchant-center-mcp"
+"Bug Tracker" = "https://github.com/webloom-fr/merchant-center-mcp/issues"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

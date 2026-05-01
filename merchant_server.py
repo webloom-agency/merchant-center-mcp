@@ -15,8 +15,10 @@ import os
 import json
 import re
 import time
+import difflib
 import logging
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 import requests
 from google.oauth2.credentials import Credentials
@@ -418,6 +420,9 @@ def _is_readonly_method(method: str, path: str) -> bool:
     return False
 
 
+_HTTP_TIMEOUT_SECONDS = float(os.getenv("MERCHANT_HTTP_TIMEOUT_SECONDS", "30"))
+
+
 def _request(
     method: str,
     path: str,
@@ -425,7 +430,7 @@ def _request(
     params: Optional[Dict[str, Any]] = None,
     body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Centralized HTTP wrapper with read-only gating and error surfacing."""
+    """Centralized HTTP wrapper with read-only gating, timeouts, and error surfacing."""
     if GOOGLE_MERCHANT_READ_ONLY and not _is_readonly_method(method, path):
         raise PermissionError(
             "Write operations are disabled (GOOGLE_MERCHANT_READ_ONLY=1)."
@@ -433,9 +438,27 @@ def _request(
     url = f"{API_HOST}{path}"
     creds = get_credentials(_get_user_email())
     headers = get_headers(creds)
-    resp = requests.request(method, url, headers=headers, params=params, json=body)
+    try:
+        resp = requests.request(
+            method,
+            url,
+            headers=headers,
+            params=params,
+            json=body,
+            timeout=_HTTP_TIMEOUT_SECONDS,
+        )
+    except requests.Timeout as e:
+        raise RuntimeError(
+            f"Merchant API timeout after {_HTTP_TIMEOUT_SECONDS}s on {method} {path}"
+        ) from e
+    except requests.ConnectionError as e:
+        raise RuntimeError(f"Merchant API connection error on {method} {path}: {e}") from e
     if resp.status_code >= 400:
-        raise RuntimeError(f"Merchant API {resp.status_code} {method} {path}: {resp.text}")
+        # Surface only the API status + a truncated body to avoid leaking very large payloads
+        body_text = (resp.text or "")[:1000]
+        raise RuntimeError(
+            f"Merchant API {resp.status_code} {method} {path}: {body_text}"
+        )
     if not resp.content:
         return {}
     try:
@@ -583,6 +606,296 @@ async def get_business_info(
         f"/accounts/{ACCOUNTS_API_VERSION}/accounts/{aid}/businessInfo",
     )
     return _dump(data)
+
+
+# ----------------------------------------------------------------------------
+# Account index (per-user cached) — used by find_accounts
+# ----------------------------------------------------------------------------
+ACCOUNTS_CACHE_TTL_SECONDS = int(os.getenv("MERCHANT_ACCOUNTS_CACHE_TTL_SECONDS", "900"))
+_accounts_index_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _accounts_cache_key() -> str:
+    """Per-user cache key, isolates results in multi-tenant mode."""
+    return _get_user_email() or "__default__"
+
+
+def _account_id_from_resource(name_or_id: str) -> str:
+    """Extract digits from 'accounts/123456' / 'accounts/123/products/...' / '123-456'."""
+    if not name_or_id:
+        return ""
+    last = str(name_or_id).split("/")[-1]
+    return re.sub(r"\D", "", last)
+
+
+def _normalize_homepage(url: str) -> str:
+    """Strip scheme + 'www.' for fuzzy matching against domain queries."""
+    if not url:
+        return ""
+    try:
+        host = urlparse(url).netloc or url
+    except Exception:
+        host = url
+    host = host.lower().lstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _list_all_accounts_pages() -> List[Dict[str, Any]]:
+    """Iterate through accounts.list pagination."""
+    items: List[Dict[str, Any]] = []
+    page_token: Optional[str] = None
+    while True:
+        params: Dict[str, Any] = {"pageSize": 250}
+        if page_token:
+            params["pageToken"] = page_token
+        data = _request(
+            "GET",
+            f"/accounts/{ACCOUNTS_API_VERSION}/accounts",
+            params=params,
+        )
+        items.extend(data.get("accounts", []) or [])
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
+def _list_subaccounts_safe(parent_id: str) -> List[Dict[str, Any]]:
+    """List subaccounts of an advanced account, swallowing 'not advanced' errors."""
+    try:
+        data = _request(
+            "GET",
+            f"/accounts/{ACCOUNTS_API_VERSION}/accounts/{parent_id}:listSubaccounts",
+        )
+        return data.get("accounts", []) or []
+    except Exception as e:
+        logger.debug(f"listSubaccounts({parent_id}) failed (likely standalone): {e}")
+        return []
+
+
+def _fetch_homepage_safe(account_id: str) -> str:
+    """Fetch the homepage URI for an account; '' if unset or inaccessible."""
+    try:
+        data = _request(
+            "GET",
+            f"/accounts/{ACCOUNTS_API_VERSION}/accounts/{account_id}/homepage",
+        )
+        return data.get("uri", "") or ""
+    except Exception as e:
+        logger.debug(f"homepage({account_id}) fetch failed: {e}")
+        return ""
+
+
+def _build_accounts_index(
+    *, include_subaccounts: bool, include_homepages: bool
+) -> List[Dict[str, Any]]:
+    """
+    Build a flat index of every Merchant Center account the user can access,
+    optionally walking sub-accounts under advanced (provider) accounts and
+    optionally fetching each account's homepage URL for domain-based matching.
+    """
+    raw = _list_all_accounts_pages()
+    seen_ids: set = set()
+    index: List[Dict[str, Any]] = []
+
+    def _emit(acc: Dict[str, Any], *, parent_id: Optional[str] = None) -> None:
+        aid = _account_id_from_resource(acc.get("name", ""))
+        if not aid or aid in seen_ids:
+            return
+        seen_ids.add(aid)
+        index.append({
+            "account_id": aid,
+            "account_name": acc.get("accountName") or "",
+            "test_account": bool(acc.get("testAccount", False)),
+            "adult_content": bool(acc.get("adultContent", False)),
+            "language_code": acc.get("languageCode") or "",
+            "time_zone": (acc.get("timeZone") or {}).get("id", ""),
+            "is_subaccount": parent_id is not None,
+            "parent_id": parent_id,
+            "homepage_uri": "",
+            "homepage_host": "",
+        })
+
+    for acc in raw:
+        _emit(acc)
+
+    if include_subaccounts:
+        # Snapshot the IDs *before* expanding so we don't iterate while extending.
+        roots = [a["account_id"] for a in list(index)]
+        for parent_id in roots:
+            for sub in _list_subaccounts_safe(parent_id):
+                _emit(sub, parent_id=parent_id)
+
+    if include_homepages:
+        for entry in index:
+            uri = _fetch_homepage_safe(entry["account_id"])
+            entry["homepage_uri"] = uri
+            entry["homepage_host"] = _normalize_homepage(uri)
+
+    return index
+
+
+def _get_accounts_index(
+    *,
+    include_subaccounts: bool,
+    include_homepages: bool,
+    force_refresh: bool,
+) -> List[Dict[str, Any]]:
+    """Cached accessor for the accounts index (per-user, TTL-bound)."""
+    key = _accounts_cache_key()
+    cache = _accounts_index_cache.get(key)
+    now = int(time.time())
+    cache_valid = (
+        cache
+        and not force_refresh
+        and (now - cache.get("at", 0)) < ACCOUNTS_CACHE_TTL_SECONDS
+        and cache.get("include_subaccounts") == include_subaccounts
+        and cache.get("include_homepages") == include_homepages
+    )
+    if cache_valid:
+        return cache["items"]
+
+    items = _build_accounts_index(
+        include_subaccounts=include_subaccounts,
+        include_homepages=include_homepages,
+    )
+    _accounts_index_cache[key] = {
+        "at": now,
+        "items": items,
+        "include_subaccounts": include_subaccounts,
+        "include_homepages": include_homepages,
+    }
+    return items
+
+
+def _score_account(query: str, entry: Dict[str, Any]) -> float:
+    """
+    Relevance score: higher = better match. Combines exact-substring and
+    fuzzy similarity over accountName, accountId and homepage host.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return 0.0
+
+    name = (entry.get("account_name") or "").lower()
+    aid = entry.get("account_id") or ""
+    host = entry.get("homepage_host") or ""
+    full_uri = (entry.get("homepage_uri") or "").lower()
+
+    # Exact ID hit dominates everything else
+    if q == aid:
+        return 100.0
+
+    # Numeric query that matches an ID prefix/suffix is very strong
+    if q.isdigit() and (aid.startswith(q) or aid.endswith(q)):
+        return 50.0 + min(len(q), 10) / 10.0
+
+    # Substring hits on host/name/uri
+    substring_score = 0.0
+    if host and q in host:
+        substring_score = max(substring_score, 5.0 + (len(q) / max(len(host), 1)))
+    if name and q in name:
+        substring_score = max(substring_score, 4.0 + (len(q) / max(len(name), 1)))
+    if full_uri and q in full_uri:
+        substring_score = max(substring_score, 3.0 + (len(q) / max(len(full_uri), 1)))
+
+    # Fuzzy similarity (handles typos / partial names)
+    fuzzy = max(
+        difflib.SequenceMatcher(None, q, name).ratio() if name else 0.0,
+        difflib.SequenceMatcher(None, q, host).ratio() if host else 0.0,
+    )
+
+    return substring_score + fuzzy
+
+
+@mcp.tool()
+async def find_accounts(
+    query: str = Field(
+        description=(
+            "Free-text search: account name fragment ('Webloom'), domain "
+            "('webloom.fr'), full URL ('https://www.webloom.fr/'), or a partial "
+            "Merchant Center account ID."
+        )
+    ),
+    top_k: int = Field(default=5, description="Max number of results to return (1-25)"),
+    include_subaccounts: bool = Field(
+        default=True,
+        description=(
+            "Also walk sub-accounts of every advanced (provider) account you can "
+            "see. Slower on big agencies but lets you find a sub-account by name."
+        ),
+    ),
+    include_homepage: bool = Field(
+        default=True,
+        description=(
+            "Also fetch each account's registered homepage URL and match the query "
+            "against it (lets you search by domain). Adds one extra API call per "
+            "account; cached for 15 minutes per user."
+        ),
+    ),
+    force_refresh: bool = Field(
+        default=False,
+        description="Bypass the 15-minute per-user index cache and rebuild from scratch.",
+    ),
+) -> str:
+    """
+    Fuzzy-search the Merchant Center accounts the authenticated user has access to.
+
+    Useful when you only know a client's brand name or website domain and want
+    the corresponding Merchant Center account ID — e.g. "find me the account
+    for webloom.fr". Matches against account name, account ID, and registered
+    homepage host.
+    """
+    top_k = max(1, min(int(top_k), 25))
+
+    try:
+        items = _get_accounts_index(
+            include_subaccounts=include_subaccounts,
+            include_homepages=include_homepage,
+            force_refresh=force_refresh,
+        )
+    except Exception as e:
+        return f"Error building accounts index: {e}"
+
+    if not items:
+        return "No Merchant Center accounts accessible to this user."
+
+    # Direct ID hit (digits-only query) → bypass scoring entirely
+    digits_only = re.sub(r"\D", "", query or "")
+    if digits_only and len(digits_only) >= 6:
+        exact = [a for a in items if a["account_id"] == digits_only]
+        if exact:
+            return _dump({"query": query, "matches": exact[:top_k]})
+
+    scored = [(_score_account(query, a), a) for a in items]
+    scored = [(s, a) for s, a in scored if s > 0.3]
+    scored.sort(key=lambda x: -x[0])
+
+    matches = [a for _, a in scored[:top_k]]
+    if not matches:
+        return _dump({
+            "query": query,
+            "matches": [],
+            "hint": (
+                "No matches above threshold. Try a shorter query, set "
+                "include_homepage=true, or call list_accounts to see everything."
+            ),
+            "total_indexed": len(items),
+        })
+
+    return _dump({
+        "query": query,
+        "total_indexed": len(items),
+        "matches": [
+            {
+                **a,
+                "score": round(s, 3),
+            }
+            for (s, a) in scored[:top_k]
+        ],
+    })
 
 
 # ============================================================================
@@ -1076,9 +1389,19 @@ except Exception as e:
 if not (_OAUTH21_ENABLED and _oauth21_provider):
     app.add_middleware(BearerAuthMiddleware)
 
+# CORS: lock down to a comma-separated allow-list when MCP_CORS_ORIGINS is set;
+# otherwise default to "*" for ease of MCP client onboarding.
+_cors_env = os.getenv("MCP_CORS_ORIGINS", "").strip()
+if _cors_env and _cors_env != "*":
+    _allowed_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+    logger.info(f"CORS allow-list: {_allowed_origins}")
+else:
+    _allowed_origins = ["*"]
+    logger.info("CORS allow-list: * (set MCP_CORS_ORIGINS to restrict)")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

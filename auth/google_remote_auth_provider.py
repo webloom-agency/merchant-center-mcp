@@ -170,6 +170,15 @@ class GoogleRemoteAuthProvider(RemoteAuthProvider):
                         )
 
                         user_email = token_info.get("email")
+                        # tokeninfo returns email_verified as the string "true"/"false"
+                        email_verified = str(
+                            token_info.get("email_verified", "false")
+                        ).lower() == "true"
+                        if user_email and not email_verified:
+                            logger.warning(
+                                f"Rejecting unverified email from tokeninfo: {user_email}"
+                            )
+                            user_email = None
                         if user_email:
                             from auth.oauth21_session_store import get_oauth21_session_store
 
