@@ -391,12 +391,14 @@ Un `render.yaml` déclaratif est inclus dans le repo.
 > **Restez sur une seule instance.** L'état OAuth Google (`state`) et les
 > codes d'auth MCP éphémères sont persistés sous
 > `GOOGLE_MCP_CREDENTIALS_DIR`, donc un **redémarrage en cours de login**
-> ne casse plus le callback. Ce disque reste mono-instance sur Render : si
-> vous scalez sans sticky sessions (ou store Redis/DB partagé), authorize
-> et `/oauth2callback` peuvent atterrir sur des process différents →
-> `Unknown state` / `/token` 401. Les utilisateurs déjà connectés (refresh
-> token) ne sont pas touchés. Gardez **1 instance**, activez les sticky
-> sessions, ou partagez l'état OAuth entre instances.
+> ne casse plus le callback. Les écritures utilisent un verrou
+> inter-processus + merge-before-write pour éviter qu'un worker n'écrase
+> le login en cours d'un autre (last-writer-wins). Ce disque reste
+> mono-instance sur Render : si vous scalez sans sticky sessions (ou store
+> Redis/DB partagé), authorize et `/oauth2callback` peuvent atterrir sur
+> des process différents → `Unknown state` / `/token` 401. Les utilisateurs
+> déjà connectés (refresh token) ne sont pas touchés. Gardez **1 instance**,
+> activez les sticky sessions, ou partagez l'état OAuth entre instances.
 
 ### 3.b — Fly.io
 

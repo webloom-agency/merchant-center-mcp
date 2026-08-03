@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
 import time
@@ -76,6 +75,8 @@ class McpOauthStateStoreTests(unittest.TestCase):
             out_code_emails,
             out_code_id,
             out_user_id,
+            _pending_tombs,
+            _code_tombs,
         ) = store.deserialize_state(payload)
 
         self.assertIn("cid", out_clients)
@@ -85,26 +86,35 @@ class McpOauthStateStoreTests(unittest.TestCase):
         self.assertEqual(out_code_id[code], "id.token")
         self.assertEqual(out_user_id["user@example.com"], "id.token")
 
-    def test_expired_pending_is_dropped(self):
+    def test_tombstone_blocks_resurrection(self):
         payload = store.serialize_state(
             {},
             {},
             {},
             {},
             {
-                "old": {
+                "s": {
                     "client_id": "cid",
-                    "created_at": time.time() - store.DEFAULT_PENDING_TTL_SECONDS - 10,
+                    "created_at": time.time(),
                 }
             },
             {},
             {},
             {},
             {},
+            {"s": time.time()},
+            {},
         )
-        *_, pending, auth_codes, _, _, _ = store.deserialize_state(payload)
-        self.assertEqual(pending, {})
+        *_, pending, auth_codes, _, _, _, pending_tombs, _ = store.deserialize_state(
+            payload
+        )
+        self.assertNotIn("s", pending)
+        self.assertIn("s", pending_tombs)
         self.assertEqual(auth_codes, {})
+
+    def test_merge_dict_memory_wins(self):
+        merged = store.merge_dict({"a": 1, "b": 2}, {"b": 9, "c": 3})
+        self.assertEqual(merged, {"a": 1, "b": 9, "c": 3})
 
     def test_atomic_write_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -121,10 +131,11 @@ class McpOauthStateStoreTests(unittest.TestCase):
                     }
                 },
             )
-            store.write_mcp_oauth_state_atomic(path, payload)
+            with store.oauth_state_file_lock(path):
+                store.write_mcp_oauth_state_atomic(path, payload)
             raw = store.read_mcp_oauth_state(path)
             self.assertIsNotNone(raw)
-            *_, pending, _, _, _, _ = store.deserialize_state(raw)
+            *_, pending, _, _, _, _, _, _ = store.deserialize_state(raw)
             self.assertIn("s", pending)
 
 

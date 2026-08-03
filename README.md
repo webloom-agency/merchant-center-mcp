@@ -379,7 +379,9 @@ needed and `render blueprint deploy`.
 
 > **Stay on one instance.** Google OAuth `state` and short-lived MCP auth
 > codes are persisted under `GOOGLE_MCP_CREDENTIALS_DIR`, so a **restart
-> mid-login** no longer breaks the callback. That disk is still
+> mid-login** no longer breaks the callback. Writes use a cross-process
+> file lock + merge-before-write so concurrent workers cannot wipe each
+> other's in-flight login (last-writer-wins). That disk is still
 > single-instance on Render: if you scale to multiple dynos without sticky
 > sessions (or a shared Redis/DB store), authorize and `/oauth2callback`
 > can land on different processes and login fails with `Unknown state` /
