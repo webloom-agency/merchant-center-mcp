@@ -101,7 +101,8 @@ class GoogleOAuthProvider(OAuthProvider):
         )
         self._oauth_state_lock = threading.Lock()
 
-        # In-memory stores; clients + tokens also restored from disk when persistence is on
+        # In-memory stores; clients, tokens, pending Google state, and MCP auth
+        # codes are also restored from disk when persistence is on.
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.auth_codes: dict[str, AuthorizationCode] = {}
         self.access_tokens: dict[str, AccessToken] = {}
@@ -127,54 +128,132 @@ class GoogleOAuthProvider(OAuthProvider):
             self.refresh_token_ttl,
         )
 
-    def _load_oauth_state_from_disk_sync(self) -> None:
-        """Load persisted MCP OAuth state (sync, called from __init__)."""
-        try:
-            raw = _oauth_state_store.read_mcp_oauth_state(self._oauth_state_path)
-            if not raw:
-                return
-            clients, access_tokens, refresh_tokens, token_to_email = (
-                _oauth_state_store.deserialize_state(raw)
-            )
+    def _apply_deserialized_state(
+        self,
+        clients,
+        access_tokens,
+        refresh_tokens,
+        token_to_email,
+        pending_authorizations,
+        auth_codes,
+        auth_code_to_email,
+        auth_code_to_id_token,
+        user_id_tokens,
+        *,
+        replace: bool,
+    ) -> None:
+        if replace:
             self.clients = clients
             self.access_tokens = access_tokens
             self.refresh_tokens = refresh_tokens
             self.token_to_email = token_to_email
+            self.pending_authorizations = pending_authorizations
+            self.auth_codes = auth_codes
+            self.auth_code_to_email = auth_code_to_email
+            self._auth_code_to_id_token = auth_code_to_id_token
+            self._user_id_tokens = user_id_tokens
+            return
+        self.clients.update(clients)
+        self.access_tokens.update(access_tokens)
+        self.refresh_tokens.update(refresh_tokens)
+        self.token_to_email.update(token_to_email)
+        self.pending_authorizations.update(pending_authorizations)
+        self.auth_codes.update(auth_codes)
+        self.auth_code_to_email.update(auth_code_to_email)
+        self._auth_code_to_id_token.update(auth_code_to_id_token)
+        self._user_id_tokens.update(user_id_tokens)
+
+    def _load_oauth_state_from_disk_sync(self, *, merge: bool = False) -> bool:
+        """Load persisted MCP OAuth state (sync). Returns True if a file was loaded."""
+        try:
+            raw = _oauth_state_store.read_mcp_oauth_state(self._oauth_state_path)
+            if not raw:
+                return False
+            (
+                clients,
+                access_tokens,
+                refresh_tokens,
+                token_to_email,
+                pending_authorizations,
+                auth_codes,
+                auth_code_to_email,
+                auth_code_to_id_token,
+                user_id_tokens,
+            ) = _oauth_state_store.deserialize_state(raw)
+            self._apply_deserialized_state(
+                clients,
+                access_tokens,
+                refresh_tokens,
+                token_to_email,
+                pending_authorizations,
+                auth_codes,
+                auth_code_to_email,
+                auth_code_to_id_token,
+                user_id_tokens,
+                replace=not merge,
+            )
             _oauth_state_store.prune_expired(
-                self.access_tokens, self.refresh_tokens, self.token_to_email
+                self.access_tokens,
+                self.refresh_tokens,
+                self.token_to_email,
+                self.pending_authorizations,
+                self.auth_codes,
+                self.auth_code_to_email,
+                self._auth_code_to_id_token,
             )
-            _oauth_state_store.write_mcp_oauth_state_atomic(
-                self._oauth_state_path,
-                _oauth_state_store.serialize_state(
-                    self.clients,
-                    self.access_tokens,
-                    self.refresh_tokens,
-                    self.token_to_email,
-                ),
-            )
+            if not merge:
+                _oauth_state_store.write_mcp_oauth_state_atomic(
+                    self._oauth_state_path,
+                    _oauth_state_store.serialize_state(
+                        self.clients,
+                        self.access_tokens,
+                        self.refresh_tokens,
+                        self.token_to_email,
+                        self.pending_authorizations,
+                        self.auth_codes,
+                        self.auth_code_to_email,
+                        self._auth_code_to_id_token,
+                        self._user_id_tokens,
+                    ),
+                )
             logger.info(
                 "Restored MCP OAuth state from disk: %d clients, %d access tokens, "
-                "%d refresh tokens",
+                "%d refresh tokens, %d pending, %d auth codes",
                 len(self.clients),
                 len(self.access_tokens),
                 len(self.refresh_tokens),
+                len(self.pending_authorizations),
+                len(self.auth_codes),
             )
+            return True
         except Exception as e:
             logger.warning("Could not load MCP OAuth state from disk: %s", e, exc_info=True)
+            return False
 
     def _persist_oauth_state_sync(self) -> None:
-        """Write MCP OAuth state to disk (clients + tokens + email mapping)."""
+        """Write MCP OAuth state to disk (clients + tokens + in-flight login)."""
         if not self._oauth_persist:
             return
         with self._oauth_state_lock:
             _oauth_state_store.prune_expired(
-                self.access_tokens, self.refresh_tokens, self.token_to_email
+                self.access_tokens,
+                self.refresh_tokens,
+                self.token_to_email,
+                self.pending_authorizations,
+                self.auth_codes,
+                self.auth_code_to_email,
+                self._auth_code_to_id_token,
             )
             payload = _oauth_state_store.serialize_state(
                 self.clients,
                 self.access_tokens,
                 self.refresh_tokens,
                 self.token_to_email,
+                self.pending_authorizations,
+                self.auth_codes,
+                self.auth_code_to_email,
+                self._auth_code_to_id_token,
+                self._user_id_tokens,
             )
             _oauth_state_store.write_mcp_oauth_state_atomic(
                 self._oauth_state_path,
@@ -184,12 +263,25 @@ class GoogleOAuthProvider(OAuthProvider):
     async def _persist_oauth_state(self) -> None:
         await asyncio.to_thread(self._persist_oauth_state_sync)
 
+    def _reload_oauth_state_from_disk_locked(self) -> None:
+        """Merge disk state into memory (used when a lookup misses after restart/scale)."""
+        if not self._oauth_persist:
+            return
+        with self._oauth_state_lock:
+            self._load_oauth_state_from_disk_sync(merge=True)
+
     # ------------------------------------------------------------------
     # Client registration
     # ------------------------------------------------------------------
 
     async def get_client(self, client_id: str) -> Optional[OAuthClientInformationFull]:
-        return self.clients.get(client_id)
+        client = self.clients.get(client_id)
+        if client is not None:
+            return client
+        if self._oauth_persist:
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            return self.clients.get(client_id)
+        return None
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self.clients[client_info.client_id] = client_info
@@ -214,7 +306,9 @@ class GoogleOAuthProvider(OAuthProvider):
             "state": params.state,
             "code_challenge": params.code_challenge,
             "scopes": scopes,
+            "created_at": time.time(),
         }
+        await self._persist_oauth_state()
 
         google_params: dict[str, str] = {
             "response_type": "code",
@@ -271,13 +365,29 @@ class GoogleOAuthProvider(OAuthProvider):
             )
 
         pending = self.pending_authorizations.pop(google_state, None)
+        if not pending and self._oauth_persist:
+            # Survives process restart mid-login (common on Render deploys).
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            pending = self.pending_authorizations.pop(google_state, None)
         if not pending:
-            logger.error("Unknown state in Google callback: %s", google_state)
+            logger.error(
+                "Unknown state in Google callback: %s "
+                "(authorize and callback must share the same process memory or "
+                "persisted OAuth state; multi-instance hosts need sticky sessions "
+                "or a shared store)",
+                google_state,
+            )
             return RedirectResponse(
                 construct_redirect_uri(
                     "about:blank",
                     error="invalid_request",
-                    error_description="Unknown or expired state",
+                    error_description=(
+                        "Unknown or expired OAuth state. This usually means the "
+                        "MCP host lost in-flight login state (restart or another "
+                        "instance). Retry sign-in; if it keeps failing, the host "
+                        "must use a single instance, sticky sessions, or shared "
+                        "OAuth state persistence."
+                    ),
                 )
             )
 
@@ -323,6 +433,8 @@ class GoogleOAuthProvider(OAuthProvider):
         if google_id_token:
             self._auth_code_to_id_token[mcp_code] = google_id_token
             self._user_id_tokens[user_email] = google_id_token
+
+        await self._persist_oauth_state()
 
         logger.info(
             "Google callback success: user=%s, redirecting to client", user_email
@@ -426,6 +538,9 @@ class GoogleOAuthProvider(OAuthProvider):
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> Optional[AuthorizationCode]:
         ac = self.auth_codes.get(authorization_code)
+        if ac is None and self._oauth_persist:
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            ac = self.auth_codes.get(authorization_code)
         if not ac:
             return None
         if ac.client_id != client.client_id:
@@ -433,6 +548,8 @@ class GoogleOAuthProvider(OAuthProvider):
         if ac.expires_at < time.time():
             self.auth_codes.pop(authorization_code, None)
             self.auth_code_to_email.pop(authorization_code, None)
+            self._auth_code_to_id_token.pop(authorization_code, None)
+            await self._persist_oauth_state()
             return None
         return ac
 
@@ -442,6 +559,16 @@ class GoogleOAuthProvider(OAuthProvider):
         self.auth_codes.pop(authorization_code.code, None)
         user_email = self.auth_code_to_email.pop(authorization_code.code, None)
         google_id_token = self._auth_code_to_id_token.pop(authorization_code.code, None)
+        if user_email is None and self._oauth_persist:
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            user_email = self.auth_code_to_email.pop(authorization_code.code, None)
+            google_id_token = self._auth_code_to_id_token.pop(
+                authorization_code.code, None
+            ) or google_id_token
+            # Merge may have re-hydrated the code; ensure it is consumed once.
+            self.auth_codes.pop(authorization_code.code, None)
+            self.auth_code_to_email.pop(authorization_code.code, None)
+            self._auth_code_to_id_token.pop(authorization_code.code, None)
 
         access_token_value = secrets.token_urlsafe(32)
         refresh_token_value = secrets.token_urlsafe(32)
@@ -489,6 +616,9 @@ class GoogleOAuthProvider(OAuthProvider):
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> Optional[RefreshToken]:
         rt = self.refresh_tokens.get(refresh_token)
+        if rt is None and self._oauth_persist:
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            rt = self.refresh_tokens.get(refresh_token)
         if not rt:
             return None
         if rt.client_id != client.client_id:
@@ -569,6 +699,9 @@ class GoogleOAuthProvider(OAuthProvider):
 
     async def load_access_token(self, token: str) -> Optional[AccessToken]:
         at = self.access_tokens.get(token)
+        if at is None and self._oauth_persist:
+            await asyncio.to_thread(self._reload_oauth_state_from_disk_locked)
+            at = self.access_tokens.get(token)
         if not at:
             return None
         if at.expires_at is not None and at.expires_at < time.time():

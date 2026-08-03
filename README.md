@@ -350,8 +350,9 @@ The server is a standard Python ASGI app:
 - **Required runtime:** Python 3.11+
 - **Required environment variables:** see §6 below
 - **Required disk:** a writable directory for `GOOGLE_MCP_CREDENTIALS_DIR`
-  that survives restarts (per-user OAuth tokens + DCR client registry live
-  there). Without it every redeploy logs all your users out.
+  that survives restarts (per-user OAuth tokens, DCR client registry, and
+  in-flight login state live there). Without it every redeploy logs all
+  your users out and mid-login callbacks fail.
 
 Generic launch command:
 
@@ -375,6 +376,16 @@ pick whatever fits your stack.
 
 A declarative `render.yaml` is included in the repo; rename / adjust as
 needed and `render blueprint deploy`.
+
+> **Stay on one instance.** Google OAuth `state` and short-lived MCP auth
+> codes are persisted under `GOOGLE_MCP_CREDENTIALS_DIR`, so a **restart
+> mid-login** no longer breaks the callback. That disk is still
+> single-instance on Render: if you scale to multiple dynos without sticky
+> sessions (or a shared Redis/DB store), authorize and `/oauth2callback`
+> can land on different processes and login fails with `Unknown state` /
+> `/token` 401. Existing refresh-token users keep working; only new logins
+> hit that path. Keep **1 instance**, enable sticky sessions, or share
+> OAuth state across instances.
 
 ### 3.b — Fly.io
 
@@ -581,7 +592,8 @@ out-of-band OAuth helper) so subsequent runs are headless.
 - [ ] DCR + auth flow with Cursor lands on Google's consent screen showing **only** the `auth/content` + `openid email profile` scopes (no `adwords` scope)
 - [ ] After consent, `list_accounts` returns the user's Merchant Center accounts
 - [ ] `run_merchant_query(account_id, "SELECT product_view.id, product_view.title FROM productView LIMIT 5")` returns rows
-- [ ] Restarting the server does **not** force re-login (verify `<credentials_dir>/mcp_oauth/server_state.json` is restored)
+- [ ] Restarting the server **mid-login** still completes OAuth (pending Google `state` restored from `server_state.json`)
+- [ ] Restarting the server does **not** force re-login for already-connected users (verify `<credentials_dir>/mcp_oauth/server_state.json` is restored)
 - [ ] Trying any (future) write tool with `GOOGLE_MERCHANT_READ_ONLY=1` returns `PermissionError`
 - [ ] Two different Google accounts using the same MCP server see different `list_accounts` results
 
@@ -598,7 +610,7 @@ See `.env.example` for the full list and inline comments. The most important:
 | `GOOGLE_OAUTH_REDIRECT_URI` | The Google-registered redirect URI (`<base>/oauth2callback`) |
 | `MERCHANT_MCP_EXTERNAL_URL` | Public URL of this server (used in OAuth metadata behind reverse proxies) |
 | `GOOGLE_MCP_CREDENTIALS_DIR` | Where per-user JSON credential files live (must persist across restarts) |
-| `MCP_OAUTH_STATE_PERSIST` | `true` to persist DCR clients + MCP tokens across restarts |
+| `MCP_OAUTH_STATE_PERSIST` | `true` to persist DCR clients, in-flight Google OAuth state, MCP auth codes, and MCP tokens across restarts |
 | `MCP_ACCESS_TOKEN_TTL_SECONDS` | TTL for MCP-issued access tokens (default 3600) |
 | `MCP_REFRESH_TOKEN_TTL_SECONDS` | TTL for MCP-issued refresh tokens (default 30 days) |
 | `GOOGLE_MERCHANT_READ_ONLY` | `1` (default) blocks every non-`:search` / non-`:render*` write |

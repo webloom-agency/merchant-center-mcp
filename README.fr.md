@@ -362,8 +362,9 @@ Le serveur est une application Python ASGI standard :
 - **Variables d'environnement requises :** voir §6
 - **Disque requis :** un répertoire inscriptible pour
   `GOOGLE_MCP_CREDENTIALS_DIR`, qui survit aux redéploiements (les jetons
-  OAuth par utilisateur et le registre des clients DCR y vivent). Sans ça,
-  chaque redéploiement déconnecte tous vos utilisateurs.
+  OAuth par utilisateur, le registre des clients DCR et l'état de login en
+  cours y vivent). Sans ça, chaque redéploiement déconnecte tous vos
+  utilisateurs et les callbacks mid-login échouent.
 
 Commande de lancement générique :
 
@@ -386,6 +387,16 @@ choisissez ce qui colle à votre stack.
 | `GOOGLE_MCP_CREDENTIALS_DIR` | `/data/credentials` |
 
 Un `render.yaml` déclaratif est inclus dans le repo.
+
+> **Restez sur une seule instance.** L'état OAuth Google (`state`) et les
+> codes d'auth MCP éphémères sont persistés sous
+> `GOOGLE_MCP_CREDENTIALS_DIR`, donc un **redémarrage en cours de login**
+> ne casse plus le callback. Ce disque reste mono-instance sur Render : si
+> vous scalez sans sticky sessions (ou store Redis/DB partagé), authorize
+> et `/oauth2callback` peuvent atterrir sur des process différents →
+> `Unknown state` / `/token` 401. Les utilisateurs déjà connectés (refresh
+> token) ne sont pas touchés. Gardez **1 instance**, activez les sticky
+> sessions, ou partagez l'état OAuth entre instances.
 
 ### 3.b — Fly.io
 
@@ -600,7 +611,8 @@ headless.
 - [ ] Le DCR + auth flow depuis Cursor amène sur l'écran Google n'affichant **que** les scopes `auth/content` + `openid email profile` (pas d'`adwords`)
 - [ ] Après consentement, `list_accounts` renvoie les comptes Merchant Center de l'utilisateur
 - [ ] `run_merchant_query(account_id, "SELECT product_view.id, product_view.title FROM productView LIMIT 5")` renvoie des lignes
-- [ ] Un redémarrage du serveur **ne force pas** la reconnexion (vérifier `<credentials_dir>/mcp_oauth/server_state.json`)
+- [ ] Un redémarrage **en cours de login** laisse quand même l'OAuth aboutir (`state` Google restauré depuis `server_state.json`)
+- [ ] Un redémarrage du serveur **ne force pas** la reconnexion des utilisateurs déjà connectés (vérifier `<credentials_dir>/mcp_oauth/server_state.json`)
 - [ ] Un appel à un (futur) outil d'écriture avec `GOOGLE_MERCHANT_READ_ONLY=1` lève `PermissionError`
 - [ ] Deux comptes Google différents qui interrogent le même serveur voient des `list_accounts` différents
 
@@ -618,7 +630,7 @@ plus importantes :
 | `GOOGLE_OAUTH_REDIRECT_URI` | L'URI de redirection enregistrée chez Google (`<base>/oauth2callback`) |
 | `MERCHANT_MCP_EXTERNAL_URL` | URL publique du serveur (utilisée derrière les reverse proxies) |
 | `GOOGLE_MCP_CREDENTIALS_DIR` | Répertoire des fichiers JSON de credentials par utilisateur (doit être persistant) |
-| `MCP_OAUTH_STATE_PERSIST` | `true` pour persister les clients DCR + jetons MCP entre redémarrages |
+| `MCP_OAUTH_STATE_PERSIST` | `true` pour persister les clients DCR, l'état OAuth Google en cours, les codes d'auth MCP et les jetons MCP entre redémarrages |
 | `MCP_ACCESS_TOKEN_TTL_SECONDS` | TTL des access tokens MCP (défaut 3600) |
 | `MCP_REFRESH_TOKEN_TTL_SECONDS` | TTL des refresh tokens MCP (défaut 30 jours) |
 | `GOOGLE_MERCHANT_READ_ONLY` | `1` (défaut) bloque tout appel non `:search` / non `:render*` |
