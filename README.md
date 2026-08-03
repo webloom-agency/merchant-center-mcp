@@ -716,6 +716,9 @@ plus the trade-offs you should be aware of when deploying.
 **What it does well**
 
 - **OAuth 2.1 with PKCE (S256)** for the MCP-side flow; PKCE is *required*
+  for public clients. Token-endpoint auth advertises ``client_secret_post``
+  (matching DCR); the server also accepts HTTP Basic so MCP SDK clients
+  that prefer Basic still work.
   when `MCP_ENABLE_OAUTH21=true`.
 - **MCP-issued tokens are server-minted**, opaque, and have configurable
   TTLs (1 hour access / 30 days refresh by default). Refresh tokens are
